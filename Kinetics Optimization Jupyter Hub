@@ -1,0 +1,1568 @@
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+import os
+import time
+import traceback
+import sys
+from scipy.optimize import minimize
+from scipy.optimize import fmin
+from scipy.integrate import solve_ivp
+from functools import partial
+from pathlib import Path
+from IPython.display import clear_output
+from mpi4py import MPI
+
+from IPython.display import display, Image
+
+# Set environment variable for MPI
+os.environ['OMPI_MCA_btl_vader_single_copy_mechanism'] = 'none'
+
+# Initialize MPI
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+
+# Define constants for the calculation and optimization
+a1, a2 =  1.183e4, -29.061
+b1, b2= -4.773e3, 4.672
+
+R = 8.314  # Gas constant in J/mol·K
+
+# Parameters for reactor model
+reactor_length = 0.35 #m
+num_partitions = 40 #numer of partitions
+rb = 872.5  # Bulk density of the catalyst (kg/m^3)
+A_cross = 0.0002 #m²
+V_r = 0.00007 # reactor volume in m³
+m_cat = rb * V_r # total mass of catalyst in kg
+
+
+# Define the data directory - adjust this to your Jupyter working directory
+DATA_DIR = Path('./data')  # Acceses the data directory in Jupyter
+OUTPUT_DIR = Path('./output')  # Accesses the output directory in Jupyter
+
+# Create directories if they don't exist
+DATA_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Load data with correct decimal and column separators
+data = pd.read_csv(DATA_DIR / 'TestParams_CZ.csv', 
+                   sep=';',          # Semicolon as column separator
+                   decimal=',',       # Comma as decimal separator
+                   thousands='.')     # Period as thousands separator
+
+# Convert the data to arrays, ensuring proper number format
+T = data['Temperature_K'].values.astype(float)
+u_s = data['Gas_velocity'].values.astype(float)
+
+# Load experimental data - convert from bar to Pa
+P_CO2_exp = data['pCO2'].values.astype(float) * 1e5  # bar to Pa
+P_CO_exp = data['pCO'].values.astype(float) * 1e5
+P_H2_exp = data['pH2'].values.astype(float) * 1e5
+P_MeOH_exp = data['pMeOH'].values.astype(float) * 1e5
+P_H2O_exp = data['pH2O'].values.astype(float) * 1e5
+
+# Initial reactor entry partial pressures - convert from bar to Pa
+P_CO2_i = data['p_CO2_0'].values.astype(float) * 1e5
+P_CO_i = data['p_CO_0'].values.astype(float) * 1e5
+P_H2_i = data['p_H2_0'].values.astype(float) * 1e5
+P_MeOH_i = data['p_MeOH_0'].values.astype(float) * 1e5
+P_H2O_i = data['p_H2O_0'].values.astype(float) * 1e5
+
+r_MeOH_exp = data['r_MeOH'].values.astype(float)
+r_H2O_exp = data['r_H2O'].values.astype(float)
+
+
+def Keq_MeOH_CO(T):
+    ln_Keq2 = a1/T + a2
+    return np.exp(ln_Keq2)
+
+def Keq_RWGS(T):
+    ln_Keq_RWGS = b1/T + b2
+    return np.exp(ln_Keq_RWGS)
+
+def Keq_MeOH(T):
+    return Keq_MeOH_CO(T) * Keq_RWGS(T)
+
+def arrhenius(A, Ea, T):
+    return A * np.exp(-Ea / (R * T))
+    
+
+def vanthoff(B, dH, T):
+    return B * np.exp(-dH / (R * T))
+ 
+def get_rate_combinations():
+    # Numerator options for each reaction
+    meoh_df_options = {
+        '1': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2 - (P_MeOH * P_H2O / (P_H2**2 * Keq_m))),
+        '2': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2**1.5 - (P_MeOH * P_H2O / (P_H2**1.5 * Keq_m))),
+        '3': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2**2 - (P_MeOH * P_H2O / (P_H2 * Keq_m))),
+        '4': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2**2.5 - (P_MeOH * P_H2O / (P_H2**0.5 * Keq_m)))
+    }
+    
+    rwgs_options = {
+        '1': lambda P_CO2, P_H2, P_CO, P_H2O, Keq_rwgs: (P_CO2 * P_H2**0.5 - (P_CO * P_H2O / (P_H2**0.5 * Keq_rwgs))),
+        '2': lambda P_CO2, P_H2, P_CO, P_H2O, Keq_rwgs: (P_CO2 * P_H2 - (P_CO * P_H2O / (Keq_rwgs)))
+    }
+    
+    meoh_co_options = {
+        '1': lambda P_CO, P_H2, P_MeOH, Keq_m_co: (P_CO * P_H2**0.5 - (P_MeOH / (P_H2**1.5 * Keq_m_co))),
+        '2': lambda P_CO, P_H2, P_MeOH, Keq_m_co: (P_CO * P_H2 - (P_MeOH / (P_H2 * Keq_m_co))),
+        '3': lambda P_CO, P_H2, P_MeOH, Keq_m_co: (P_CO * P_H2**1.5 - (P_MeOH / (P_H2**0.5 * Keq_m_co)))
+    }
+    
+    # Generate all combinations
+    combinations = []
+    for meoh_name, meoh_func in meoh_df_options.items():  # Changed from meoh_options to meoh_df_options
+        for rwgs_name, rwgs_func in rwgs_options.items():
+            for meoh_co_name, meoh_co_func in meoh_co_options.items():
+                combinations.append({
+                    'id': f"{meoh_name}_{rwgs_name}_{meoh_co_name}",
+                    'meoh_func': meoh_func,
+                    'rwgs_func': rwgs_func,
+                    'meoh_co_func': meoh_co_func
+                })
+    
+    return combinations
+
+def rate_model_with_combination(params, P_CO2, P_CO, P_H2, P_MeOH, P_H2O, T, rate_funcs, debug=False):
+    """Modified rate_model that uses different numerator combinations but same denominator"""
+    try:
+        if debug and rank == 0:
+            print(f"Rate model for combination {rate_funcs.get('id', 'Unknown')}")
+        
+        A_MeOH, Ea_MeOH, A_MeOH_CO, Ea_MeOH_CO, A_RWGS, Ea_RWGS, B_CO2, dH_CO2, B_H2, dH_H2, B_CO, dH_CO, B_H2O, dH_H2O = params
+    
+        # Add small epsilon to prevent division by zero
+        epsilon = 1e-10
+        P_H2_safe = np.maximum(P_H2, epsilon)
+    
+        # Calculate all constants
+        k_MeOH = arrhenius(A_MeOH, Ea_MeOH, T)
+        k_MeOH_CO = arrhenius(A_MeOH_CO, Ea_MeOH_CO, T)
+        k_RWGS = arrhenius(A_RWGS, Ea_RWGS, T)
+    
+        K_CO2 = vanthoff(B_CO2, dH_CO2, T)
+        K_H2 = vanthoff(B_H2, dH_H2, T)
+        K_CO = vanthoff(B_CO, dH_CO, T)
+        K_H2O = vanthoff(B_H2O, dH_H2O, T)
+    
+        # Calculate equilibrium constants with safety
+        Keq_m = np.maximum(Keq_MeOH(T), epsilon)
+        Keq_rwgs = np.maximum(Keq_RWGS(T), epsilon)
+        Keq_m_co = np.maximum(Keq_MeOH_CO(T), epsilon)
+    
+        # Common denominator calculation (same for all combinations)
+        term1 = np.maximum(1 + K_CO * P_CO + K_CO2 * P_CO2, epsilon)
+        term2 = np.maximum(P_H2_safe**0.5 + K_H2O * P_H2O, epsilon)
+        denom = term1 * term2
+    
+        # Modify the driving force calculations to use passed rate functions
+        df_MeOH = rate_funcs['meoh_func'](P_CO2, P_H2_safe, P_MeOH, P_H2O, Keq_m)
+        df_RWGS = rate_funcs['rwgs_func'](P_CO2, P_H2_safe, P_CO, P_H2O, Keq_rwgs)
+        df_MeOH_CO = rate_funcs['meoh_co_func'](P_CO, P_H2_safe, P_MeOH, Keq_m_co)
+    
+        # Calculate rates with different numerators but same denominator
+        r_MeOH = np.clip(k_MeOH * K_CO2 * df_MeOH / denom, -1e6, 1e6)
+        r_RWGS = np.clip(k_RWGS * K_CO2 * df_RWGS / denom, -1e6, 1e6)
+        r_MeOH_CO = np.clip(k_MeOH_CO * K_CO * df_MeOH_CO / denom, -1e6, 1e6)
+    
+        if debug:
+            print("\nRate Model Analysis:")
+            print(f"Numerator combination: {rate_funcs['id']}")
+            print("\nConstants:")
+            print(f"k_MeOH: {k_MeOH:.3e}")
+            print(f"k_RWGS: {k_RWGS:.3e}")
+            print(f"k_MeOH_CO: {k_MeOH_CO:.3e}")
+    
+        return r_MeOH, r_RWGS, r_MeOH_CO
+
+    except Exception as e:
+        print(f"Error in rate_model_with_combination: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+def plug_flow_reactor(z, C, T, u_s_initial, params, combination_data=None):
+    """
+    ODE function for reactor model with improved numerical stability
+    
+    Added combination_data parameter with a default of None
+    """
+    # Set minimum concentration threshold
+    min_conc = 1e-20
+    
+    # Ensure positive concentrations with smooth transition
+    C = np.array(C, dtype=float)
+    C = np.maximum(C, min_conc)
+    
+    # Calculate partial pressures with safety checks
+    RT = R * T
+    P = np.maximum(C * RT, min_conc) / 1e5  # Convert to bar with minimum threshold
+    
+    # Get reaction rates with guaranteed positive pressures
+    r_MeOH, r_RWGS, r_MeOH_CO = rate_model_with_combination(
+        params,
+        P[0],  # P_CO2
+        P[1],  # P_CO
+        P[2],  # P_H2
+        P[3],  # P_MeOH
+        P[4],  # P_H2O
+        T,
+        combination_data,  # Pass the entire combination data
+        debug=False
+    )
+    
+    # Calculate total molar concentration with safety
+    C_total = np.sum(C)
+    C_total_initial = np.sum(C)
+    
+    # Calculate stoichiometric changes with bounded rates
+    delta_n_total = rb * (-2 * r_MeOH + 0 * r_RWGS - 2 * r_MeOH_CO)
+    
+    # Ensure reasonable contraction factor
+    C_total_updated = max(C_total + delta_n_total, min_conc)
+    contraction_factor = max(min(C_total_initial / C_total_updated, 10.0), 0.1)
+    
+    # Calculate local velocity with bounds
+    u_s_local = max(u_s_initial * contraction_factor, u_s_initial * 0.1)
+    
+    # Calculate reaction terms with bounded rates
+    reaction_terms = np.array([
+        rb * (-r_MeOH - r_RWGS),                    # CO2
+        rb * (r_RWGS - r_MeOH_CO),                  # CO
+        rb * (-3*r_MeOH - 2*r_MeOH_CO - r_RWGS),   # H2
+        rb * (r_MeOH + r_MeOH_CO),                  # MeOH
+        rb * (r_MeOH + r_RWGS)                      # H2O
+    ])
+    
+    # Calculate derivatives with safety checks
+    dCdz = np.clip(reaction_terms / u_s_local, -1e7, 1e7)
+    
+    return dCdz
+
+def calculate_reactor_profile(params, T, u_s, initial_conditions, combination_data, debug=False):
+    """Modified to use unified solution"""
+    reactor_data = calculate_unified_reactor_solution(
+        params, T, u_s, initial_conditions, combination_data
+    )
+    
+    if reactor_data is None:
+        return None, None, float('inf')
+    
+    if debug:
+        print("\nReactor Profile Analysis:")
+        print(f"Number of points: {len(reactor_data['z_eval'])}")
+        print(f"Total smoothness penalty: {reactor_data['smoothness_penalty']:.2e}")
+        
+        if reactor_data['smoothness_penalty'] > 0:
+            print("\nWarning: Unphysical behavior detected")
+            
+        rate_changes = np.diff(reactor_data['rates'], axis=0)
+        max_rate_change = np.max(np.abs(rate_changes), axis=0)
+        print("\nRate change analysis:")
+        print(f"Max rate changes [mol/kg_cat/s]:")
+        print(f"MeOH: {max_rate_change[0]:.3e}")
+        print(f"RWGS: {max_rate_change[1]:.3e}")
+        print(f"MeOH_CO: {max_rate_change[2]:.3e}")
+    
+    return reactor_data['solution'], reactor_data['rates'], reactor_data['smoothness_penalty']
+
+
+def solve_reactor(z, C, T, u_s, params):
+    """
+    Wrapper function for solve_ivp compatibility
+    """
+    return plug_flow_reactor(z, C, T, u_s_initial=u_s, params=params)
+
+def constraint_function(params):
+    A_MeOH, Ea_MeOH, A_MeOH_CO, Ea_MeOH_CO, A_RWGS, Ea_RWGS, B_CO2, dH_CO2, B_H2, dH_H2, B_CO, dH_CO, B_H2O, dH_H2O = params
+    # Constraints for fitting parameters with physical meaning
+    constraints = np.array([
+        A_MeOH - 1e-12,     # A_MeOH > 0
+        A_RWGS - 1e-12,     # A_RWGS > 0
+        A_MeOH_CO - 1e-12,  # A_MeOH_CO > 0
+        Ea_MeOH - 1e-10,    # Ea_MeOH > 0
+        Ea_RWGS - 1e-10,    # Ea_RWGS > 0
+        Ea_MeOH_CO - 1e-10, # Ea_MeOH_CO > 0
+        
+        # Van't Hoff parameters
+        B_CO2 - 1e-13,       # B_CO2 > 1e-8
+        B_H2 - 1e-13,        # B_H2 > 1e-8
+        B_CO - 1e-13,        # B_CO > 1e-8
+        B_H2O - 1e-13,       # B_H2O > 1e-8
+        
+        # Ensure negative enthalpies with reasonable magnitudes
+        -dH_CO2 - 100,    # dH_CO2 < -0.1 kJ/mol
+        -dH_H2 - 100,     # dH_H2 < -0.1 kJ/mol
+        -dH_CO - 100,     # dH_CO < -0.1 kJ/mol
+        -dH_H2O - 100,    # dH_H2O < -0.1 kJ/mol
+        
+        # Upper bounds for enthalpies
+        4000000 + dH_CO2,    # dH_CO2 > -4000 kJ/mol
+        4000000 + dH_H2,     # dH_H2 > -4000 kJ/mol
+        4000000 + dH_CO,     # dH_CO > -4000 kJ/mol
+        4000000 + dH_H2O,    # dH_H2O > -4000 kJ/mol
+        
+        # Upper bounds for pre-exponentials
+        2 - B_CO2,       # B_CO2 < 2
+        2 - B_H2,        # B_H2 < 2
+        2 - B_CO,        # B_CO < 2
+        2 - B_H2O        # B_H2O < 2
+    ])
+    return constraints
+
+def analyze_rate_components(params, P_CO2_bar, P_CO_bar, P_H2_bar, P_MeOH_bar, P_H2O_bar, T):
+    """
+    Detailed analysis of rate components
+    """
+    # Calculate each term independently
+    k_MeOH = arrhenius(params[0], params[1], T)
+    k_RWGS = arrhenius(params[4], params[5], T)
+    k_MeOH_CO = arrhenius(params[2], params[3], T)
+    
+    K_CO2 = vanthoff(params[6], params[7], T)
+    K_CO = vanthoff(params[10], params[11], T)
+    K_H2O = vanthoff(params[12], params[13], T)
+    
+    print("\nComponent Analysis:")
+    print("Rate Constants:")
+    print(f"k_MeOH: {k_MeOH:.2e} (A={params[0]:.2e}, Ea={params[1]:.2e})")
+    print(f"k_RWGS: {k_RWGS:.2e} (A={params[4]:.2e}, Ea={params[5]:.2e})")
+    print(f"k_MeOH_CO: {k_MeOH_CO:.2e} (A={params[2]:.2e}, Ea={params[3]:.2e})")
+    
+    print("\nAdsorption Terms:")
+    print(f"K_CO2*P_CO2: {K_CO2 * P_CO2_bar:.2e}")
+    print(f"K_CO*P_CO: {K_CO * P_CO_bar:.2e}")
+    print(f"K_H2O*P_H2O: {K_H2O * P_H2O_bar:.2e}")
+    
+    # Calculate individual denominator contributions
+    term1_components = {
+        'base': 1.0,
+        'CO': K_CO * P_CO_bar,
+        'CO2': K_CO2 * P_CO2_bar
+    }
+    
+    term2_components = {
+        'H2': P_H2_bar**0.5,
+        'H2O': K_H2O * P_H2O_bar
+    }
+    
+    print("\nDenominator Components:")
+    print("Term 1 components:")
+    for name, value in term1_components.items():
+        print(f"{name}: {value:.2e}")
+    
+    print("\nTerm 2 components:")
+    for name, value in term2_components.items():
+        print(f"{name}: {value:.2e}")
+    
+    return k_MeOH, k_RWGS, k_MeOH_CO, term1_components, term2_components
+
+def calculate_unified_reactor_solution(params, T, u_s, initial_conditions, combination_data):
+    """
+    Unified function that calculates reactor profile, rates, and penalties once
+    Returns all needed data for other functions
+    """
+    try:
+        # Set up evaluation points
+        z_eval = np.linspace(0, reactor_length, 20)
+        
+        # Solve ODE once
+        partial_reactor = partial(plug_flow_reactor,
+                              params=params,
+                              T=T,
+                              u_s_initial=u_s,
+                              combination_data=combination_data)
+        
+        sol = solve_ivp(
+            partial_reactor,
+            [0, reactor_length],
+            initial_conditions,
+            method='BDF',
+            t_eval=z_eval,
+            rtol=1e-6,
+            atol=1e-8,
+            max_step=reactor_length/15
+        )
+        
+        if not sol.success:
+            return None
+            
+        # Calculate all needed values in one pass
+        derivatives = []
+        rates = []
+        RT = R * T
+        
+        # Calculate all profiles at once
+        for j in range(len(z_eval)):
+            C = sol.y[:, j]
+            P = np.maximum(C * RT, 1e-20) / 1e5  # Convert to bar
+            
+            # Calculate rates once
+            r_MeOH, r_RWGS, r_MeOH_CO = rate_model_with_combination(
+                params,
+                P[0], P[1], P[2], P[3], P[4],
+                T,
+                combination_data,
+                debug=False
+            )
+            
+            # Calculate derivatives once
+            dCdz = plug_flow_reactor(
+                z_eval[j],
+                C,
+                T,
+                u_s,
+                params,
+                combination_data
+            )
+            
+            derivatives.append(dCdz)
+            rates.append([r_MeOH, r_RWGS, r_MeOH_CO])
+        
+        derivatives = np.array(derivatives)
+        rates = np.array(rates)
+        
+        # Calculate smoothness penalty once
+        smoothness_penalty = 0.0
+        for species_idx in [3, 4]:  # MeOH and H2O indices
+            species_derivatives = derivatives[:, species_idx]
+            sign_changes = np.diff(np.sign(species_derivatives))
+            n_oscillations = np.sum(np.abs(sign_changes) > 0)
+            
+            if n_oscillations > 1:
+                smoothness_penalty += n_oscillations * 0.1
+        
+        # Calculate formation rates once
+        C_inlet = sol.y[:, 0]
+        C_exit = sol.y[:, -1]
+        
+        total_moles_in = sum(C_inlet) * RT
+        total_moles_out = sum(C_exit) * RT
+        
+        F_v_in = u_s * A_cross
+        F_v_out = F_v_in * (total_moles_out / total_moles_in)
+        
+        formed_MeOH = F_v_out * C_exit[3] - F_v_in * C_inlet[3]
+        formed_H2O = F_v_out * C_exit[4] - F_v_in * C_inlet[4]
+        
+        r_MeOH_formed = formed_MeOH / m_cat
+        r_H2O_formed = formed_H2O / m_cat
+        
+        return {
+            'solution': sol,
+            'derivatives': derivatives,
+            'rates': rates,
+            'z_eval': z_eval,
+            'smoothness_penalty': smoothness_penalty,
+            'r_MeOH': r_MeOH_formed,
+            'r_H2O': r_H2O_formed,
+            'profiles': {
+                'C': sol.y,
+                'P': np.maximum(sol.y * RT, 1e-20) / 1e5,  # In bar
+                'velocity': u_s * (sum(C_inlet) / np.sum(sol.y, axis=0))
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error in unified reactor solution: {e}")
+        traceback.print_exc()
+        return None
+
+def calculate_overall_rates_parallel(params, temperatures, velocities, num_points, 
+                                   P_CO2_initial, P_CO_initial, P_H2_initial, 
+                                   P_MeOH_initial, P_H2O_initial, 
+                                   combination_data):
+    """Calculate overall reaction rates with caching and improved efficiency"""
+    try:
+        # Input validation
+        if combination_data is None:
+            print(f"Rank {rank} - Error: combination_data is None")
+            return np.ones(num_points) * 1e10, np.ones(num_points) * 1e10, np.ones(num_points) * float('inf')
+            
+        required_keys = ['meoh_func', 'rwgs_func', 'meoh_co_func']
+        if not all(key in combination_data for key in required_keys):
+            print(f"Rank {rank} - Error: Missing rate functions. Found keys: {list(combination_data.keys())}")
+            return np.ones(num_points) * 1e10, np.ones(num_points) * 1e10, np.ones(num_points) * float('inf')
+        
+        # Initialize arrays
+        r_MeOH_fitted = np.zeros(num_points)
+        r_H2O_fitted = np.zeros(num_points)
+        smoothness_penalties = np.zeros(num_points)
+        
+        # Process each point
+        for i in range(num_points):
+            try:
+                initial_conditions = np.array([
+                    P_CO2_initial[i] / (R * temperatures[i]),
+                    P_CO_initial[i] / (R * temperatures[i]),
+                    P_H2_initial[i] / (R * temperatures[i]),
+                    P_MeOH_initial[i] / (R * temperatures[i]),
+                    P_H2O_initial[i] / (R * temperatures[i])
+                ])
+                
+                reactor_data = calculate_unified_reactor_solution(
+                    params,
+                    temperatures[i],
+                    velocities[i],
+                    initial_conditions,
+                    combination_data
+                )
+                
+                if reactor_data is None:
+                    r_MeOH_fitted[i] = 1e10
+                    r_H2O_fitted[i] = 1e10
+                    smoothness_penalties[i] = float('inf')
+                    continue
+                    
+                r_MeOH_fitted[i] = reactor_data['r_MeOH']
+                r_H2O_fitted[i] = reactor_data['r_H2O']
+                smoothness_penalties[i] = reactor_data['smoothness_penalty']
+                
+            except Exception as e:
+                print(f"Rank {rank} - Error in point {i} calculation: {str(e)}")
+                r_MeOH_fitted[i] = 1e10
+                r_H2O_fitted[i] = 1e10
+                smoothness_penalties[i] = float('inf')
+        
+        # Validate final results
+        if np.any(np.isnan(r_MeOH_fitted)) or np.any(np.isnan(r_H2O_fitted)):
+            print(f"Rank {rank} - Warning: NaN values in fitted rates")
+            return np.ones(num_points) * 1e10, np.ones(num_points) * 1e10, np.ones(num_points) * float('inf')
+            
+        return r_MeOH_fitted, r_H2O_fitted, smoothness_penalties
+        
+    except Exception as e:
+        print(f"Rank {rank} - Error in rate calculation: {str(e)}")
+        return np.ones(num_points) * 1e10, np.ones(num_points) * 1e10, np.ones(num_points) * float('inf')
+    
+def save_rank_results(rank, stage, combination_id, params, error, timestamp, interrupted=False, combination_data=None):
+    try:
+        result_dict = {
+            'rank': rank,
+            'combination_id': combination_id,
+            'stage': stage,
+            'final_error': error,
+            'calculation_time_minutes': timestamp,
+            'interrupted': interrupted,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Add parameters
+        param_names = ['A_MeOH', 'Ea_MeOH', 'A_MeOH_CO', 'Ea_MeOH_CO', 'A_RWGS', 'Ea_RWGS', 
+                      'B_CO2', 'dH_CO2', 'B_H2', 'dH_H2', 'B_CO', 'dH_CO', 'B_H2O', 'dH_H2O']
+        for name, value in zip(param_names, params):
+            result_dict[f'param_{name}'] = value
+            
+        # Correctly unpack three values
+        r_MeOH_fitted, r_H2O_fitted, smoothness_penalties = calculate_overall_rates_parallel(
+            params, T, u_s, len(T),
+            P_CO2_i, P_CO_i, P_H2_i, P_MeOH_i, P_H2O_i,
+            combination_data
+        )
+        
+        # Calculate statistics
+        rel_errors_MeOH = (r_MeOH_fitted - r_MeOH_exp)/r_MeOH_exp
+        result_dict.update({
+            'MeOH_mean_rel_error': np.mean(rel_errors_MeOH),
+            'MeOH_max_rel_error': np.max(np.abs(rel_errors_MeOH)),
+            'MeOH_rmse': np.sqrt(np.mean((r_MeOH_fitted - r_MeOH_exp)**2)),
+            'MeOH_worst_point': np.argmax(np.abs(rel_errors_MeOH))
+        })
+        
+        rel_errors_H2O = (r_H2O_fitted - r_H2O_exp)/r_H2O_exp
+        result_dict.update({
+            'H2O_mean_rel_error': np.mean(rel_errors_H2O),
+            'H2O_max_rel_error': np.max(np.abs(rel_errors_H2O)),
+            'H2O_rmse': np.sqrt(np.mean((r_H2O_fitted - r_H2O_exp)**2)),
+            'H2O_worst_point': np.argmax(np.abs(rel_errors_H2O))
+        })
+        
+        # RWGS analysis
+        excess_water = r_H2O_fitted - r_MeOH_fitted
+        expected_rwgs = r_H2O_exp - r_MeOH_exp
+        rwgs_errors = []
+        for ex, exp in zip(excess_water, expected_rwgs):
+            if exp > 0:
+                rwgs_errors.append((ex - exp)/exp)
+        if rwgs_errors:
+            result_dict.update({
+                'RWGS_mean_rel_error': np.mean(rwgs_errors),
+                'RWGS_max_rel_error': np.max(np.abs(rwgs_errors))
+            })
+        
+        # Save point-by-point results
+        results_df = pd.DataFrame({
+            'Point': range(len(T)),
+            'Temperature_K': T,
+            'MeOH_exp': r_MeOH_exp,
+            'MeOH_fitted': r_MeOH_fitted,
+            'MeOH_rel_error': rel_errors_MeOH,
+            'H2O_exp': r_H2O_exp,
+            'H2O_fitted': r_H2O_fitted,
+            'H2O_rel_error': rel_errors_H2O,
+            'RWGS_expected': expected_rwgs,
+            'RWGS_fitted': excess_water
+        })
+        
+        # Save to files
+        summary_filename = f'rank_{rank}_combination_{combination_id}_{stage}_{"interrupted_" if interrupted else ""}summary_CZ.csv'
+        details_filename = f'rank_{rank}_combination_{combination_id}_{stage}_{"interrupted_" if interrupted else ""}details_CZ.csv'
+        
+        pd.DataFrame([result_dict]).to_csv(OUTPUT_DIR / summary_filename, index=False)
+        results_df.to_csv(OUTPUT_DIR / details_filename, index=False)
+        
+        print(f"Rank {rank} results saved to {summary_filename} and {details_filename}")
+        
+    except Exception as e:
+        print(f"Error saving results for rank {rank}: {e}")
+        traceback.print_exc()
+    
+def analyze_error_components(r_MeOH_fitted, r_H2O_fitted, r_MeOH_exp, r_H2O_exp):
+    """Detailed breakdown of error components"""
+    # Initialize error components
+    error_components = {
+        'meoh_errors': [],
+        'h2o_errors': [],
+        'smoothness_meoh': 0,
+        'smoothness_h2o': 0,
+        'rwgs_errors': [],
+        'point_errors': []
+    }
+    
+    # Calculate errors for each experimental point
+    for i in range(len(r_MeOH_exp)):
+        # Relative errors
+        rel_error_MeOH = (r_MeOH_fitted[i] - r_MeOH_exp[i])/r_MeOH_exp[i]
+        rel_error_H2O = (r_H2O_fitted[i] - r_H2O_exp[i])/r_H2O_exp[i]
+        
+        error_components['meoh_errors'].append(rel_error_MeOH**2)
+        error_components['h2o_errors'].append(3 * rel_error_H2O**2)  # Note the 3x weighting
+        
+        # RWGS specific error
+        excess_water = r_H2O_fitted[i] - r_MeOH_fitted[i]
+        expected_rwgs = r_H2O_exp[i] - r_MeOH_exp[i]
+        if expected_rwgs > 0:
+            rel_error_RWGS = (excess_water - expected_rwgs) / expected_rwgs
+            rwgs_penalty = 2 * rel_error_RWGS**2
+        else:
+            rwgs_penalty = 0
+        error_components['rwgs_errors'].append(rwgs_penalty)
+    
+    # Calculate smoothness terms
+    if len(r_MeOH_exp) > 1:
+        dC_MeOH = np.diff(r_MeOH_fitted)
+        dC_H2O = np.diff(r_H2O_fitted)
+        error_components['smoothness_meoh'] = 0.1 * np.mean(np.abs(dC_MeOH)) / np.mean(r_MeOH_fitted)
+        error_components['smoothness_h2o'] = 0.2 * np.mean(np.abs(dC_H2O)) / np.mean(r_H2O_fitted)
+    
+    # Create detailed summary
+    summary = {
+        'MeOH_squared_errors': {
+            'mean': np.mean(error_components['meoh_errors']),
+            'max': np.max(error_components['meoh_errors']),
+            'total': np.sum(error_components['meoh_errors']),
+            'worst_point': np.argmax(error_components['meoh_errors'])
+        },
+        'H2O_squared_errors': {
+            'mean': np.mean(error_components['h2o_errors']),
+            'max': np.max(error_components['h2o_errors']),
+            'total': np.sum(error_components['h2o_errors']),
+            'worst_point': np.argmax(error_components['h2o_errors'])
+        },
+        'RWGS_penalties': {
+            'mean': np.mean(error_components['rwgs_errors']),
+            'max': np.max(error_components['rwgs_errors']),
+            'total': np.sum(error_components['rwgs_errors']),
+            'worst_point': np.argmax(error_components['rwgs_errors'])
+        },
+        'Smoothness': {
+            'MeOH': error_components['smoothness_meoh'],
+            'H2O': error_components['smoothness_h2o']
+        }
+    }
+    
+    return summary    
+
+def objective_function_parallel(params, combination_data):
+    """Parallel version of objective function with enhanced debugging and corrected smoothness handling"""
+    # Initialize counters
+    if not hasattr(objective_function_parallel, 'counter'):
+        objective_function_parallel.counter = 0
+    if not hasattr(objective_function_parallel, f'counter_rank_{rank}'):
+        setattr(objective_function_parallel, f'counter_rank_{rank}', 0)
+    
+    rank_counter = getattr(objective_function_parallel, f'counter_rank_{rank}')
+    
+    # Basic debug output (every 100 iterations)
+    if rank_counter % 100 == 0:
+        param_names = ['A_MeOH', 'Ea_MeOH', 'A_MeOH_CO', 'Ea_MeOH_CO', 'A_RWGS', 'Ea_RWGS', 
+                      'B_CO2', 'dH_CO2', 'B_H2', 'dH_H2', 'B_CO', 'dH_CO', 'B_H2O', 'dH2O']
+        param_str = ' | '.join([f"{name}: {value:.2e}" for name, value in zip(param_names, params)])
+        
+        print(f"\nRank {rank} - Combination {combination_data['id']} - Iteration {rank_counter}")
+        print(f"Parameters: {param_str}")
+        sys.stdout.flush()
+    
+    # Update counters
+    setattr(objective_function_parallel, f'counter_rank_{rank}', rank_counter + 1)
+    objective_function_parallel.counter += 1
+    
+    # Check constraints
+    constraints = constraint_function(params)
+    penalty = 0
+    if np.any(constraints < 0):
+        penalty = 1e6 * np.sum(np.abs(constraints[constraints < 0]))
+        if rank_counter % 100 == 0:
+            print(f"Rank {rank} - Constraint violation, penalty: {penalty:.3e}")
+    
+    try:
+        total_error = 0
+        individual_rate_penalty = 0
+        
+        meoh_errors = []
+        h2o_errors = []
+        rwgs_errors = []
+        smoothness_penalties = []
+        
+        for i in range(len(T)):
+            initial_conditions = np.array([
+                P_CO2_i[i] / (R * T[i]),
+                P_CO_i[i] / (R * T[i]),
+                P_H2_i[i] / (R * T[i]),
+                P_MeOH_i[i] / (R * T[i]),
+                P_H2O_i[i] / (R * T[i])
+            ])
+            
+            # Use unified solution
+            reactor_data = calculate_unified_reactor_solution(
+                params,
+                T[i],
+                u_s[i],
+                initial_conditions,
+                combination_data
+                )
+
+            if reactor_data is None:
+                return 1e10
+
+            r_MeOH = reactor_data['r_MeOH']
+            r_H2O = reactor_data['r_H2O']
+            smoothness_penalty = reactor_data['smoothness_penalty']
+            
+            # Calculate errors
+            rel_error_MeOH = (r_MeOH - r_MeOH_exp[i])/r_MeOH_exp[i]
+            rel_error_H2O = (r_H2O - r_H2O_exp[i])/r_H2O_exp[i]
+            
+            meoh_error = rel_error_MeOH**2
+            h2o_error = 3 * rel_error_H2O**2
+            
+            meoh_errors.append(meoh_error)
+            h2o_errors.append(h2o_error)
+            smoothness_penalties.append(smoothness_penalty)
+            
+            # Calculate RWGS contribution
+            excess_water = r_H2O - r_MeOH
+            expected_rwgs = r_H2O_exp[i] - r_MeOH_exp[i]
+            
+            # Base error including smoothness for this test point
+            point_error = (
+                meoh_error +
+                h2o_error +
+                0.2 * smoothness_penalty  # Weight for profile smoothness
+            )
+            
+            # Add RWGS penalty if significant
+            if expected_rwgs > 0:
+                rel_error_RWGS = (excess_water - expected_rwgs) / expected_rwgs
+                rwgs_penalty = 2 * rel_error_RWGS**2
+                rwgs_errors.append(rwgs_penalty)
+                point_error += rwgs_penalty
+            else:
+                rwgs_errors.append(0)
+                
+            total_error += point_error
+            
+            # Check for very low rates
+            if r_MeOH < 1e-6 or r_H2O < 1e-6:
+                individual_rate_penalty = 1e7
+        
+        final_error = total_error + penalty + individual_rate_penalty
+        
+        # Detailed error analysis every 500 iterations
+        if rank_counter % 500 == 0:
+            print(f"\nRank {rank} - Detailed Error Breakdown at iteration {rank_counter}:")
+            print("\nMeOH Errors:")
+            print(f"  Mean squared error: {np.mean(meoh_errors):.2e}")
+            print(f"  Max squared error: {np.max(meoh_errors):.2e}")
+            print(f"  Total contribution: {np.sum(meoh_errors):.2e}")
+            print(f"  Worst at point: {np.argmax(meoh_errors)}")
+            
+            print("\nH2O Errors (3x weighted):")
+            print(f"  Mean squared error: {np.mean(h2o_errors):.2e}")
+            print(f"  Max squared error: {np.max(h2o_errors):.2e}")
+            print(f"  Total contribution: {np.sum(h2o_errors):.2e}")
+            print(f"  Worst at point: {np.argmax(h2o_errors)}")
+            
+            if rwgs_errors:
+                print("\nRWGS Penalties:")
+                print(f"  Mean penalty: {np.mean(rwgs_errors):.2e}")
+                print(f"  Max penalty: {np.max(rwgs_errors):.2e}")
+                print(f"  Total contribution: {np.sum(rwgs_errors):.2e}")
+            
+            print("\nSmoothness Penalties:")
+            print(f"  Mean: {np.mean(smoothness_penalties):.2e}")
+            print(f"  Max: {np.max(smoothness_penalties):.2e}")
+            print(f"  Total contribution: {0.2 * np.sum(smoothness_penalties):.2e}")
+            print(f"  Worst at point: {np.argmax(smoothness_penalties)}")
+            
+            if individual_rate_penalty > 0:
+                print(f"\nRate penalty applied: {individual_rate_penalty:.2e}")
+            if penalty > 0:
+                print(f"Constraint penalty applied: {penalty:.2e}")
+            
+            print(f"\nTotal Error: {final_error:.2e}")
+            sys.stdout.flush()
+        
+        # Regular error output every 250 iterations
+        elif rank_counter % 250 == 0:
+            print(f"Rank {rank} - Error breakdown: Base={total_error:.3e} | Constraint={penalty:.3e} | Rate={individual_rate_penalty:.3e} | Final={final_error:.3e}")
+            sys.stdout.flush()
+        
+        return final_error
+        
+    except Exception as e:
+        print(f"Rank {rank} - Error in objective function: {str(e)}")
+        traceback.print_exc()
+        sys.stdout.flush()
+        return 1e10
+    
+initial_guess_params = {
+    'A_MeOH': 3000, 
+    'Ea_MeOH': 80000, 
+    'A_MeOH_CO': 6000, 
+    'Ea_MeOH_CO': 40000,
+    'A_RWGS': 120000, 
+    'Ea_RWGS': 100000, 
+    'B_CO2': 1e-3, 
+    'dH_CO2': -70000,
+    'B_H2': 1e-4,
+    'dH_H2': -105000,
+    'B_CO': 1e-3,
+    'dH_CO': -60000,
+    'B_H2O': 1e-4,
+    'dH_H2O': -80000
+}
+
+# Define bounds to prevent extreme values
+bounds = [
+    (1e-5, 1e12),      # A_MeOH
+    (1e-5, 2e10),      # Ea_MeOH
+    (1e-5, 1e12),      # A_MeOH_CO
+    (1e-5, 2e10),      # Ea_MeOH_CO
+    (1e-5, 1e12),      # A_RWGS
+    (1e-5, 2e10),      # Ea_RWGS
+    (9e-12, 5),    # B_CO2
+    (-8e8, -2e2),  # dH_CO2
+    (9e-12, 5),    # B_H2
+    (-8e8, -2e2),  # dH_H2
+    (9e-12, 5),    # B_CO
+    (-8e8, -2e2),  # dH_CO
+    (9e-12, 5),    # B_H2O
+    (-8e8, -2e2)   # dH_H2O
+]
+
+# Convert to array
+initial_guess = np.array(list(initial_guess_params.values()))
+
+def generate_random_guess():
+    """Generate a random initial guess for the parameters"""
+    random_guess = np.array([
+        np.random.uniform(1e-2, 1e8),    # A_MeOH
+        np.random.uniform(1e-2, 2e8),    # Ea_MeOH
+        np.random.uniform(1e-2, 1e8),    # A_MeOH_CO
+        np.random.uniform(1e-2, 2e8),    # Ea_MeOH_CO
+        np.random.uniform(1e-2, 1e8),    # A_RWGS
+        np.random.uniform(1e-2, 2e8),    # Ea_RWGS
+        np.random.uniform(1e-12, 1),     # B_CO2
+        np.random.uniform(-1.2e8, -2e2), # dH_CO2
+        np.random.uniform(1e-12, 1),     # B_H2
+        np.random.uniform(-1.2e8, -2e2), # dH_H2
+        np.random.uniform(1e-12, 1),     # B_CO
+        np.random.uniform(-1.2e8, -2e2), # dH_CO
+        np.random.uniform(1e-12, 1),     # B_H2O
+        np.random.uniform(-1.2e8, -2e2)  # dH_H2O
+    ])
+    return random_guess
+
+def calculate_adaptive_scale_factors(params, combination_data, current_rank):
+    """Rank-safe implementation"""
+    # Explicitly use rank
+    base_error = objective_function_parallel(params, combination_data)
+    
+    # Ensure calculations are rank-specific
+    sensitivities = []
+    for i in range(len(params)):
+        params_plus = params.copy()
+        params_plus[i] *= 1.01
+        
+        # Use rank-specific error calculation
+        error_plus = objective_function_parallel(params_plus, combination_data)
+        
+        sensitivity = abs((error_plus - base_error)/(0.01 * params[i]))
+        sensitivities.append(sensitivity)
+    
+    # Create rank-specific scale factors
+    scale_factors = np.array([
+        1.0/max(s, 1e-10) for s in sensitivities
+    ])
+    
+    # Store scale factors in rank-specific way
+    scale_factors_dict = {f'rank_{current_rank}': scale_factors}
+    
+    return scale_factors
+
+def run_sequential_multi_strategy_optimization_parallel(combination_data, nm_timeout=240, lbfgs_timeout=180):
+    """
+    Multi-stage optimization with rank-safe adaptive scale factors
+    """
+    try:
+        # Store rank locally for safety
+        local_rank = rank
+        
+        # Initialize time tracking
+        nm_start_time = time.time()
+        
+        # Rank-specific data container
+        rank_data = {
+            'best_nm_result': None,
+            'best_nm_error': float('inf'),
+            'best_nm_strategy': None,
+            'best_scale_factors': None,
+            'interrupted': False
+        }
+        
+        # Initial scale factors (used as fallback)
+        default_scale_factors = np.array([
+            1e-3, 1e-4, 1e-3, 1e-4, 1e-5, 1e-5,
+            1e2, 1e-4, 1e2, 1e-4, 1e2, 1e-4, 1e2, 1e-4
+        ])
+        
+        # Define optimization strategies
+        strategies = [
+            ("Original", np.array(list(initial_guess_params.values()))),
+            ("Literature", np.array([
+                7.1e-1, 3.38e4, 1.42e9, 1.2e5, 2.76e11, 1.34e5,
+                6.173e-7, -5.67e4, 1e-3, -1.05e5, 3.56e-3, -8.44e3, 3.52e-12, -1.24e5
+            ])),
+            ("Random", generate_random_guess())
+        ]
+        
+        # Run Nelder-Mead strategies with timeout
+        for strategy_index, (strategy_name, initial_guess) in enumerate(strategies):
+            try:
+                elapsed_time = (time.time() - nm_start_time) / 60
+                if elapsed_time > nm_timeout:
+                    print(f"Rank {local_rank} - Nelder-Mead timeout after {elapsed_time:.1f} minutes")
+                    rank_data['interrupted'] = True
+                    break
+                
+                print(f"Rank {local_rank} - Starting strategy {strategy_index + 1} of {len(strategies)}: {strategy_name}")
+                
+                # Calculate initial adaptive scale factors for this strategy and rank
+                try:
+                    current_scale_factors = calculate_adaptive_scale_factors(
+                        initial_guess, 
+                        combination_data,
+                        local_rank
+                    )
+                    print(f"Rank {local_rank} - Using adaptive scale factors for {strategy_name}")
+                except Exception as e:
+                    print(f"Rank {local_rank} - Failed to calculate adaptive scale factors: {e}")
+                    print(f"Rank {local_rank} - Using default scale factors")
+                    current_scale_factors = default_scale_factors.copy()
+                
+                # Reset iteration counters for this strategy
+                strategy_counter = 0
+                
+                # Define rank-safe objective function closure
+                def rank_safe_objective(x):
+                    nonlocal strategy_counter, current_scale_factors
+                    strategy_counter += 1
+                    
+                    # Update scale factors periodically (rank-specific)
+                    if strategy_counter % 500 == 0:
+                        try:
+                            current_params = x / current_scale_factors
+                            new_scale_factors = calculate_adaptive_scale_factors(
+                                current_params, 
+                                combination_data,
+                                local_rank
+                            )
+                            # Smooth transition
+                            current_scale_factors = 0.7 * current_scale_factors + 0.3 * new_scale_factors
+                            print(f"Rank {local_rank} - Updated scale factors at iteration {strategy_counter}")
+                        except Exception as e:
+                            print(f"Rank {local_rank} - Failed to update scale factors: {e}")
+                    
+                    return objective_function_parallel(x / current_scale_factors, combination_data)
+                
+                # Run Nelder-Mead with rank-safe objective
+                scaled_guess = initial_guess * current_scale_factors
+                result_nm = fmin(
+                    rank_safe_objective,
+                    scaled_guess,
+                    maxiter=3500,
+                    maxfun=4000,
+                    ftol=1e-6,
+                    xtol=1e-6,
+                    disp=True
+                )
+                
+                # Unscale results
+                unscaled_nm = result_nm / current_scale_factors
+                error_nm = objective_function_parallel(unscaled_nm, combination_data)
+                
+                # Save intermediate results with rank information
+                elapsed_time = (time.time() - nm_start_time) / 60
+                save_rank_results(
+                    local_rank, 
+                    f'nelder_mead_{strategy_name}',
+                    combination_data['id'],
+                    unscaled_nm, 
+                    error_nm, 
+                    elapsed_time,
+                    interrupted=False,
+                    combination_data=combination_data
+                )
+                
+                # Update best results if improved
+                if error_nm < rank_data['best_nm_error']:
+                    rank_data.update({
+                        'best_nm_error': error_nm,
+                        'best_nm_result': result_nm,
+                        'best_nm_strategy': strategy_name,
+                        'best_scale_factors': current_scale_factors.copy()
+                    })
+                    
+            except Exception as e:
+                print(f"Rank {local_rank} - Error in {strategy_name} strategy: {str(e)}")
+                continue
+        
+        # Check if we should proceed with L-BFGS-B
+        if rank_data['interrupted'] or rank_data['best_nm_result'] is None:
+            print(f"Rank {local_rank} - Skipping L-BFGS-B due to Nelder-Mead timeout/failure")
+            if rank_data['best_nm_result'] is not None:
+                return rank_data['best_nm_result'] / rank_data['best_scale_factors'], rank_data['best_nm_error']
+            return None, float('inf')
+        
+        # L-BFGS-B refinement with rank safety
+        lbfgs_start_time = time.time()
+        try:
+            print(f"Rank {local_rank} - Starting L-BFGS-B refinement")
+            scaled_bounds = [(l * sf, u * sf) for (l, u), sf in zip(bounds, rank_data['best_scale_factors'])]
+            
+            result_lbfgs = minimize(
+                lambda x: objective_function_parallel(x / rank_data['best_scale_factors'], combination_data),
+                rank_data['best_nm_result'],
+                method='L-BFGS-B',
+                bounds=scaled_bounds,
+                options={
+                    'maxiter': 2500,
+                    'maxfun': 3000,
+                    'ftol': 1e-6,
+                    'gtol': 1e-5
+                }
+            )
+            
+            if result_lbfgs.success:
+                final_params = result_lbfgs.x / rank_data['best_scale_factors']
+                final_error = result_lbfgs.fun
+                
+                # Save final results
+                total_time = (time.time() - nm_start_time) / 60
+                save_rank_results(
+                    local_rank,
+                    'final',
+                    combination_data['id'],
+                    final_params,
+                    final_error,
+                    total_time,
+                    interrupted=False,
+                    combination_data=combination_data
+                )
+                
+                return final_params, final_error
+                
+        except Exception as e:
+            print(f"Rank {local_rank} - L-BFGS-B failed: {str(e)}")
+            
+        # Return best Nelder-Mead result if L-BFGS-B fails
+        return rank_data['best_nm_result'] / rank_data['best_scale_factors'], rank_data['best_nm_error']
+            
+    except Exception as e:
+        print(f"Rank {local_rank} - Critical error: {str(e)}")
+        traceback.print_exc()
+        return None, float('inf')
+    
+
+def calculate_statistics_parallel(optimized_params, combination_index, combination_data):
+    """
+    Calculate comprehensive statistics for a single optimization result
+    
+    Parameters:
+    - optimized_params: Optimized parameters for specific rate combination
+    - combination_index: Unique identifier for the rate combination
+    - combination_data: Specific rate combination details
+    
+    Returns:
+    - DataFrame with statistical analysis results or None if calculation fails
+    """
+    # Get MPI communicator and rank information
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # Only perform statistics calculation on the processor that ran the optimization
+    try:
+        # Calculate rates with optimized parameters
+        r_MeOH_fitted, r_H2O_fitted = calculate_overall_rates_parallel(
+            optimized_params, T, u_s, len(T),
+            P_CO2_i, P_CO_i, P_H2_i, P_MeOH_i, P_H2O_i,
+            combination_data
+        )
+
+        # Calculate residuals
+        residuals_MeOH = r_MeOH_exp - r_MeOH_fitted
+        residuals_H2O = r_H2O_exp - r_H2O_fitted
+
+        # Calculate number of observations and parameters
+        n = len(r_MeOH_exp) + len(r_H2O_exp)
+        p = len(optimized_params)
+
+        # Calculate residual standard error
+        residual_std_error = np.sqrt(
+            (np.sum(residuals_MeOH**2) + np.sum(residuals_H2O**2)) / (n - p)
+        )
+
+        # Calculate 95% confidence intervals
+        t_value = stats.t.ppf(0.95, n - p)
+        conf_intervals = np.column_stack((
+            optimized_params - t_value * residual_std_error,
+            optimized_params + t_value * residual_std_error
+        ))
+
+        # Calculate t-values and p-values
+        t_values = optimized_params / residual_std_error
+        df_t = n - p
+        p_values_t = 2 * (1 - stats.t.cdf(np.abs(t_values), df_t))
+
+        # Chi-Squared-Test
+        chi_square_stat = (np.sum((residuals_MeOH ** 2) / np.var(residuals_MeOH)) + 
+                         np.sum((residuals_H2O ** 2) / np.var(residuals_H2O)))
+        df_chi2 = n - p
+        p_value_chi2 = 1 - stats.chi2.cdf(chi_square_stat, df_chi2)
+
+        # R-squared calculation
+        SS_res = np.sum(residuals_MeOH**2) + np.sum(residuals_H2O**2)
+        SS_tot_MeOH = np.sum((r_MeOH_exp - np.mean(r_MeOH_exp))**2)
+        SS_tot_H2O = np.sum((r_H2O_exp - np.mean(r_H2O_exp))**2)
+        SS_tot = SS_tot_MeOH + SS_tot_H2O
+        R_squared = 1 - (SS_res / SS_tot) if SS_tot != 0 else 1
+
+        # Create DataFrame with results
+        param_names = ['A_MeOH', 'Ea_MeOH', 'A_MeOH_CO', 'Ea_MeOH_CO', 'A_RWGS', 'Ea_RWGS', 
+                      'B_CO2', 'dH_CO2', 'B_H2', 'dH_H2', 'B_CO', 'dH_CO', 'B_H2O', 'dH_H2O']
+        
+        optimized_params_df = pd.DataFrame({
+            'Parameter': param_names,
+            'Optimized Value': optimized_params,
+            '95% CI Lower': conf_intervals[:, 0],
+            '95% CI Upper': conf_intervals[:, 1],
+            't-value': t_values,
+            'p-value (t-test)': p_values_t
+        })
+
+        # Add variance information
+        optimized_params_df['Variance_MeOH'] = np.var(residuals_MeOH)
+        optimized_params_df['Variance_H2O'] = np.var(residuals_H2O)
+
+        # Add chi-square and R-squared rows
+        chi_square_row = pd.DataFrame({
+            'Parameter': ['Chi-square statistic'],
+            'Optimized Value': [chi_square_stat],
+            '95% CI Lower': [np.nan],
+            '95% CI Upper': [np.nan],
+            'Variance_MeOH': [np.var(residuals_MeOH)],
+            'Variance_H2O': [np.var(residuals_H2O)],
+            't-value': [np.nan],
+            'p-value (t-test)': [p_value_chi2]
+        })
+
+        r_squared_row = pd.DataFrame({
+            'Parameter': ['R-squared'],
+            'Optimized Value': [R_squared],
+            '95% CI Lower': [np.nan],
+            '95% CI Upper': [np.nan],
+            'Variance_MeOH': [np.nan],
+            'Variance_H2O': [np.nan],
+            't-value': [np.nan],
+            'p-value (t-test)': [np.nan]
+        })
+
+        # Combine results
+        optimized_params_df = pd.concat(
+            [optimized_params_df, chi_square_row, r_squared_row], 
+            ignore_index=True
+        )
+
+        # Add combination index to results
+        optimized_params_df['Combination_Index'] = combination_index
+
+        # Save results for each combination
+        output_filename = f"statistical_analysis_combination_{combination_index}_CZ.csv"
+        output_path = OUTPUT_DIR / output_filename
+        optimized_params_df.to_csv(output_path, index=False)
+
+        print(f"\nStatistical Analysis Complete for Combination {combination_index}:")
+        print(f"R-squared: {R_squared:.4f}")
+        print(f"Chi-square statistic: {chi_square_stat:.4f} (p-value: {p_value_chi2:.4f})")
+        print(f"Results saved to: {output_path}")
+
+        return optimized_params_df
+
+    except Exception as e:
+        print(f"Error in statistical analysis for combination {combination_index}: {str(e)}")
+        return None
+          
+# Function to save results to CSV in JupyterLab 
+def save_results(optimized_params, r_MeOH_fitted, r_H2O_fitted, optimized_params_df, combination_data):
+    """
+    Save results to CSV files with consistent pressure units (bar)
+    """
+    try:
+        # Get profiles for exit pressures using unified reactor solution
+        all_exit_data = []
+        for i in range(len(T)):
+            initial_conditions = np.array([
+                P_CO2_i[i] / (R * T[i]),
+                P_CO_i[i] / (R * T[i]),
+                P_H2_i[i] / (R * T[i]),
+                P_MeOH_i[i] / (R * T[i]),
+                P_H2O_i[i] / (R * T[i])
+            ])
+            
+            reactor_data = calculate_unified_reactor_solution(
+                optimized_params,
+                T[i],
+                u_s[i],
+                initial_conditions,
+                combination_data
+            )
+            
+            if reactor_data is not None:
+                # Get exit pressures from profiles (already in bar)
+                exit_data = {
+                    'P_CO2_calc': reactor_data['profiles']['P'][-1, 0],
+                    'P_CO_calc': reactor_data['profiles']['P'][-1, 1],
+                    'P_H2_calc': reactor_data['profiles']['P'][-1, 2],
+                    'P_MeOH_calc': reactor_data['profiles']['P'][-1, 3],
+                    'P_H2O_calc': reactor_data['profiles']['P'][-1, 4]
+                }
+            else:
+                exit_data = {
+                    'P_CO2_calc': np.nan,
+                    'P_CO_calc': np.nan,
+                    'P_H2_calc': np.nan,
+                    'P_MeOH_calc': np.nan,
+                    'P_H2O_calc': np.nan
+                }
+            all_exit_data.append(exit_data)
+            
+        # Create comprehensive results DataFrame (all pressures in bar)
+        results_df = pd.DataFrame({
+            'Temperature_K': T,
+            'Gas_velocity': u_s,
+            # Experimental pressures (convert Pa to bar)
+            'P_CO2_exp': P_CO2_exp / 1e5,
+            'P_CO_exp': P_CO_exp / 1e5,
+            'P_H2_exp': P_H2_exp / 1e5,
+            'P_MeOH_exp': P_MeOH_exp / 1e5,
+            'P_H2O_exp': P_H2O_exp / 1e5,
+            # Initial pressures in bar
+            'P_CO2_initial': P_CO2_i / 1e5,
+            'P_CO_initial': P_CO_i / 1e5,
+            'P_H2_initial': P_H2_i / 1e5,
+            'P_MeOH_initial': P_MeOH_i / 1e5,
+            'P_H2O_initial': P_H2O_i / 1e5,
+            # Reaction rates
+            'r_MeOH_fitted': r_MeOH_fitted,
+            'r_H2O_fitted': r_H2O_fitted,
+            'r_MeOH_measured': r_MeOH_exp,
+            'r_H2O_measured': r_H2O_exp,
+        })
+        
+        # Add calculated exit pressures
+        for key in ['P_CO2_calc', 'P_CO_calc', 'P_H2_calc', 'P_MeOH_calc', 'P_H2O_calc']:
+            results_df[key] = [d[key] for d in all_exit_data]
+        
+        # Add residuals
+        results_df['Residual_MeOH'] = r_MeOH_exp - r_MeOH_fitted
+        results_df['Residual_H2O'] = r_H2O_exp - r_H2O_fitted
+        
+        # Add conversion calculations
+        results_df['X_CO2'] = (results_df['P_CO2_initial'] - results_df['P_CO2_calc']) / results_df['P_CO2_initial'] * 100
+        results_df['Y_MeOH'] = results_df['P_MeOH_calc'] / results_df['P_CO2_initial'] * 100
+        
+        # Save complete results with combination ID
+        results_file = OUTPUT_DIR / f'complete_results_combination_{combination_data["id"]}_CZ.csv'
+        results_df.to_csv(results_file, index=False)
+        
+        # Save parameters file
+        params_file = OUTPUT_DIR / f'parameters_combination_{combination_data["id"]}_CZ.csv'
+        optimized_params_df.to_csv(params_file, index=False)
+        
+        # Print verification
+        print("\nPressure verification for first point (all in bar):")
+        print(f"CO2 initial: {results_df['P_CO2_initial'].iloc[0]:.3f}")
+        print(f"CO2 experimental: {results_df['P_CO2_exp'].iloc[0]:.3f}")
+        print(f"CO2 calculated: {results_df['P_CO2_calc'].iloc[0]:.3f}")
+        print(f"CO2 conversion: {results_df['X_CO2'].iloc[0]:.1f}%")
+        print(f"MeOH yield: {results_df['Y_MeOH'].iloc[0]:.1f}%")
+        
+        print(f"\nResults saved to:")
+        print(f"- {params_file} (Parameters and statistics)")
+        print(f"- {results_file} (Complete results)")
+        
+    except Exception as e:
+        print(f"Error in save_results: {e}")
+        traceback.print_exc()
+
+
+def plot_reactor_profiles(params, T, u_s, test_conditions, combination_data):
+    """
+    Plot and save reactor profiles with corrected pressure handling
+    """
+    # Create DataFrame to store all results
+    all_profiles = pd.DataFrame()
+    
+    for test_point in range(test_conditions):
+        print(f"\nProcessing test condition {test_point + 1}/{test_conditions}")
+        
+        # Calculate profiles
+        z_points = np.linspace(0, reactor_length, 50)
+        initial_conditions = np.array([
+            P_CO2_i[test_point] / (R * T[test_point]),
+            P_CO_i[test_point] / (R * T[test_point]),
+            P_H2_i[test_point] / (R * T[test_point]),
+            P_MeOH_i[test_point] / (R * T[test_point]),
+            P_H2O_i[test_point] / (R * T[test_point])
+        ])
+        
+        # Solve reactor with updated parameter name
+        partial_reactor = partial(plug_flow_reactor, 
+                                params=params, 
+                                T=T[test_point], 
+                                u_s_initial=u_s[test_point],  # Changed u_s to u_s_initial
+                                combination_data=combination_data)
+        
+        sol = solve_ivp(
+            partial_reactor,
+            [0, reactor_length],
+            initial_conditions,
+            method='BDF',
+            t_eval=z_points,
+            rtol=1e-6,
+            atol=1e-8
+        )
+        
+        if not sol.success:
+            print(f"Warning: ODE solver failed for test {test_point}")
+            continue
+        
+        # Calculate pressures [Pa]
+        P_CO2 = sol.y[0] * R * T[test_point]
+        P_CO = sol.y[1] * R * T[test_point]
+        P_H2 = sol.y[2] * R * T[test_point]
+        P_MeOH = sol.y[3] * R * T[test_point]
+        P_H2O = sol.y[4] * R * T[test_point]
+        
+        # Create profiles DataFrame with pressures in bar
+        profiles = pd.DataFrame({
+            'Test_Point': test_point + 1,
+            'Temperature_K': T[test_point],
+            'Reactor_Length': z_points,
+            'P_CO2': P_CO2 / 1e5,  # Convert to bar for plotting
+            'P_CO': P_CO / 1e5,
+            'P_H2': P_H2 / 1e5,
+            'P_MeOH': P_MeOH / 1e5,
+            'P_H2O': P_H2O / 1e5
+        })
+        
+        # Calculate total moles and local velocity
+        C_total = np.sum(sol.y, axis=0)
+        C_total_initial = np.sum(initial_conditions)
+        u_s_local = u_s[test_point] * (C_total_initial / C_total)
+        profiles['Velocity'] = u_s_local
+        
+        # Calculate rates using Pa pressures and combination_data
+        r_MeOH = np.zeros(len(z_points))
+        r_RWGS = np.zeros(len(z_points))
+        r_MeOH_CO = np.zeros(len(z_points))
+        
+        for i in range(len(z_points)):
+            r_m, r_r, r_mc = rate_model_with_combination(
+                params,
+                P_CO2[i] / 1e5,      # Convert to bar for rate model
+                P_CO[i] / 1e5,
+                P_H2[i] / 1e5,
+                P_MeOH[i] / 1e5,
+                P_H2O[i] / 1e5,
+                T[test_point],
+                combination_data  # Pass combination_data to rate model
+            )
+            r_MeOH[i] = r_m
+            r_RWGS[i] = r_r
+            r_MeOH_CO[i] = r_mc
+        
+        profiles['r_MeOH'] = r_MeOH
+        profiles['r_RWGS'] = r_RWGS
+        profiles['r_MeOH_CO'] = r_MeOH_CO
+        # Store profiles
+        all_profiles = pd.concat([all_profiles, profiles], ignore_index=True)          
+                
+        # Add debug output for first point
+        if test_point == 0:
+            print(f"\nDebug output for first point:")
+            print(f"Initial pressures [bar]:")
+            print(f"P_CO2: {profiles['P_CO2'].iloc[0]:.3e}")
+            print(f"P_CO: {profiles['P_CO'].iloc[0]:.3e}")
+            print(f"P_H2: {profiles['P_H2'].iloc[0]:.3e}")
+            print(f"Initial velocity: {profiles['Velocity'].iloc[0]:.3e} m/s")
+            print(f"Final velocity: {profiles['Velocity'].iloc[-1]:.3e} m/s")
+            print(f"Initial rates [mol/kg_cat/s]:")
+            print(f"r_MeOH: {r_MeOH[0]:.3e}")
+            print(f"r_RWGS: {r_RWGS[0]:.3e}")
+            print(f"r_MeOH_CO: {r_MeOH_CO[0]:.3e}")
+        
+                  
+    print("\nAll profiles saved to:")
+    print(f"- {OUTPUT_DIR}/all_reactor_profiles_CZ.csv")
+        
+    return all_profiles
+
+#Parallel combination function for parallel computing of different ranks
+def main_parallel_combinations():
+    """Main function to run parallel optimization of all rate combinations with validation"""
+    # Get all combinations and validate
+    combinations = get_rate_combinations()
+    assert combinations, "Combinations list cannot be empty"
+    
+    # Ensure total combinations match number of ranks
+    if len(combinations) != size:
+        if rank == 0:
+            print(f"Warning: Number of combinations ({len(combinations)}) does not match number of ranks ({size})")
+        if len(combinations) < size:
+            # Pad combinations if fewer than ranks
+            combinations.extend([combinations[-1]] * (size - len(combinations)))
+        else:
+            # Truncate if more combinations than ranks
+            combinations = combinations[:size]
+    
+    # Get and validate the specific combination for this rank
+    combination = combinations[rank]
+    assert combination is not None, f"Combination for rank {rank} cannot be None"
+    assert all(key in combination for key in ['meoh_func', 'rwgs_func', 'meoh_co_func']), \
+        f"Combination {combination.get('id', 'unknown')} missing required rate functions"
+    
+    if rank == 0:
+        print(f"Total combinations: {len(combinations)}")
+        print(f"Number of ranks: {size}")
+    
+    print(f"Rank {rank} - Optimization for combination ID: {combination['id']}")
+    
+    # Perform optimization for this rank's combination
+    optimization_result = run_sequential_multi_strategy_optimization_parallel(combination_data=combination)
+    
+    if optimization_result is not None:
+        params, error = optimization_result  # Unpack both values
+        if params is not None:
+            # Calculate error for ranking
+            final_error = objective_function_parallel(params, combination)
+            
+            # Prepare results for gathering
+            result_data = {
+                'combination_id': combination['id'],
+                'parameters': params,
+                'final_error': final_error
+            }
+        else:
+            result_data = None
+    else:
+        result_data = None
+    
+    # Gather results from all ranks
+    all_results = comm.gather(result_data, root=0)
+    
+    if rank == 0:
+        # Remove any None values (failed optimizations)
+        all_results = [r for r in all_results if r is not None]
+        assert all_results, "No valid results from any rank"
+        
+        # Sort results by final error
+        sorted_results = sorted(all_results, key=lambda x: x['final_error'])
+        
+        # Save and display results
+        print("\nResults for all rate equation combinations:")
+        print("\nTop 5 combinations:")
+        param_names = ['A_MeOH', 'Ea_MeOH', 'A_MeOH_CO', 'Ea_MeOH_CO', 'A_RWGS', 'Ea_RWGS', 
+                      'B_CO2', 'dH_CO2', 'B_H2', 'dH_H2', 'B_CO', 'dH_CO', 'B_H2O', 'dH_H2O']
+        
+        for i, result in enumerate(sorted_results[:5]):
+            print(f"\n{i+1}. Combination ID: {result['combination_id']}")
+            print(f"Final error: {result['final_error']:.3e}")
+            print("Parameters:")
+            for name, value in zip(param_names, result['parameters']):
+                print(f"{name}: {value:.3e}")
+        
+        # Save detailed results to a CSV
+        results_df = pd.DataFrame([
+            {
+                'combination_id': r['combination_id'],
+                'final_error': r['final_error'],
+                **{f'param_{name}': value for name, value 
+                   in zip(param_names, r['parameters'])}
+            }
+            for r in sorted_results
+        ])
+        
+        # Save to output directory
+        results_file = OUTPUT_DIR / 'rate_combinations_results_CZ.csv'
+        results_df.to_csv(results_file, index=False)
+        print(f"\nDetailed results saved to: {results_file}")
+        
+        # Perform statistical analysis for top combinations
+        print("\nPerforming statistical analysis for top combinations:")
+        for result in sorted_results[:5]:
+            combination = next(
+                combo for combo in get_rate_combinations() 
+                if combo['id'] == result['combination_id']
+            )
+            assert combination is not None, f"Could not find combination with ID {result['combination_id']}"
+            
+            # Perform statistical analysis for each top combination
+            calculate_statistics_parallel(
+                result['parameters'], 
+                result['combination_id'], 
+                combination
+            )
+
+if __name__ == "__main__":
+    if rank == 0:
+        print("Starting comprehensive parallel optimization...")
+    
+    # Run the main parallel combinations optimization
+    main_parallel_combinations()
