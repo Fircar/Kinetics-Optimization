@@ -1,0 +1,12 @@
+cff-version: 2.3.1
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Fritsch"
+    given-names: "Carl"
+    orcid: "0000-0001-8207-9880"  #
+title: "Multi Strategy Kinteic Optimization based upon Graaf et al. 1989
+version: 2.1.1
+date-released: 2025-06-26
+url: "https://github.com/yourusername/your-repo"
+repository-code: "https://github.com/Fircar/Kinetics-Optimization/"
+license: Creative Commons
