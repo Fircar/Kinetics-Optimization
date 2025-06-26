@@ -1,0 +1,838 @@
+import numpy as np
+import pandas as pd
+import time
+import traceback
+import sys
+from scipy.optimize import differential_evolution, fmin
+from scipy.integrate import solve_ivp
+from functools import partial
+from pathlib import Path
+from mpi4py import MPI
+import os
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings('ignore', message='.*differential_evolution.*')
+
+print("Script starting...")
+with open('debug_log.txt', 'w') as f:
+    f.write("Script initialized\n")
+    f.flush()
+
+# Set environment variable for MPI
+os.environ['OMPI_MCA_btl_vader_single_copy_mechanism'] = 'none'
+
+# Initialize MPI
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
+
+
+MAX_RUNTIME = 36 * 3600  # 36 hours in seconds
+start_time = time.time()
+
+
+# Define constants for the calculation and optimization
+a1, a2 = 1.183e4, -29.061
+b1, b2 = -4.773e3, 4.672
+print("Constants defined")
+
+R = 8.314  # Gas constant in J/mol·K
+
+# Parameters for reactor model
+reactor_length = 0.35  # m
+num_partitions = 40  # number of partitions
+rb = 1237.7  # Bulk density of the catalyst (kg/m^3)
+A_cross = 0.0002  # m²
+V_r = 0.00007  # reactor volume in m³
+m_cat = rb * V_r  # total mass of catalyst in kg
+
+# Define the data directory - adjust this to your Jupyter working directory
+DATA_DIR = Path('./data')  # Accesses the data directory in Jupyter
+OUTPUT_DIR = Path('./output')  # Accesses the output directory in Jupyter
+print("Data paths set up")
+
+# Define catalyst name to include in output files
+CATALYST_NAME = "CZ"  # Catalyst name
+
+# Create directories
+DATA_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Load data with correct decimal and column separators
+try:
+    data = pd.read_csv(DATA_DIR / 'TestParams_CZ.csv', 
+                       sep=';',          # Semicolon as column separator
+                       decimal=',',       # Comma as decimal separator
+                       thousands='.')     # Period as thousands separator
+    print("Data loaded successfully")
+except Exception as e:
+    print(f"Error loading data: {e}")
+
+# Convert the data 
+T = data['Temperature_K'].values.astype(float)
+u_s = data['Gas_velocity'].values.astype(float)
+
+# Load experimental rates
+MeOH_rate_exp = data['r_MeOH'].values.astype(float)
+H2O_rate_exp = data['r_H2O'].values.astype(float)
+print("Experimental rates loaded")
+
+# Load experimental data 
+P_CO2_exp = data['pCO2'].values.astype(float) * 1e5
+P_CO_exp = data['pCO'].values.astype(float) * 1e5
+P_H2_exp = data['pH2'].values.astype(float) * 1e5
+P_MeOH_exp = data['pMeOH'].values.astype(float) * 1e5
+P_H2O_exp = data['pH2O'].values.astype(float) * 1e5
+print("Experimental pressures loaded")
+
+# Initial reactor entry partial pressures
+P_CO2_i = data['p_CO2_0'].values.astype(float) * 1e5
+P_CO_i = data['p_CO_0'].values.astype(float) * 1e5
+P_H2_i = data['p_H2_0'].values.astype(float) * 1e5
+P_MeOH_i = data['p_MeOH_0'].values.astype(float) * 1e5
+P_H2O_i = data['p_H2O_0'].values.astype(float) * 1e5
+print("Initial pressures loaded")
+
+def check_timeout():
+    """Check if maximum runtime has been exceeded"""
+    return (time.time() - start_time) > MAX_RUNTIME
+
+def check_timeout_callback(xk, convergence=None):
+    """Callback function to check for timeout during optimization"""
+    if check_timeout():
+        return True
+    return False
+
+def Keq_MeOH_CO(T):
+    ln_Keq2 = a1/T + a2
+    return np.exp(ln_Keq2)
+
+def Keq_RWGS(T):
+    ln_Keq_RWGS = b1/T + b2
+    return np.exp(ln_Keq_RWGS)
+
+def Keq_MeOH(T):
+    return Keq_MeOH_CO(T) * Keq_RWGS(T)
+
+def arrhenius(A, Ea, T):
+    return A * np.exp(-Ea / (R * T))
+
+def vanthoff(B, dH, T):
+    return B * np.exp(-dH / (R * T))
+ 
+def get_rate_combinations():
+    # Numerator options for each reaction
+    meoh_df_options = {
+        '1': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2 - (P_MeOH * P_H2O / (P_H2**2 * Keq_m))),
+        '2': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2**1.5 - (P_MeOH * P_H2O / (P_H2**1.5 * Keq_m))),
+        '3': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2**2 - (P_MeOH * P_H2O / (P_H2 * Keq_m))),
+        '4': lambda P_CO2, P_H2, P_MeOH, P_H2O, Keq_m: (P_CO2 * P_H2**2.5 - (P_MeOH * P_H2O / (P_H2**0.5 * Keq_m)))
+    }
+    
+    rwgs_options = {
+        '1': lambda P_CO2, P_H2, P_CO, P_H2O, Keq_rwgs: (P_CO2 * P_H2**0.5 - (P_CO * P_H2O / (P_H2**0.5 * Keq_rwgs))),
+        '2': lambda P_CO2, P_H2, P_CO, P_H2O, Keq_rwgs: (P_CO2 * P_H2 - (P_CO * P_H2O / (Keq_rwgs)))
+    }
+    
+    meoh_co_options = {
+        '1': lambda P_CO, P_H2, P_MeOH, Keq_m_co: (P_CO * P_H2**0.5 - (P_MeOH / (P_H2**1.5 * Keq_m_co))),
+        '2': lambda P_CO, P_H2, P_MeOH, Keq_m_co: (P_CO * P_H2 - (P_MeOH / (P_H2 * Keq_m_co))),
+        '3': lambda P_CO, P_H2, P_MeOH, Keq_m_co: (P_CO * P_H2**1.5 - (P_MeOH / (P_H2**0.5 * Keq_m_co)))
+    }
+    
+    # Generate all combinations
+    combinations = []
+    for meoh_name, meoh_func in meoh_df_options.items():
+        for rwgs_name, rwgs_func in rwgs_options.items():
+            for meoh_co_name, meoh_co_func in meoh_co_options.items():
+                combinations.append({
+                    'id': f"{meoh_name}_{rwgs_name}_{meoh_co_name}",
+                    'meoh_func': meoh_func,
+                    'rwgs_func': rwgs_func,
+                    'meoh_co_func': meoh_co_func
+                })
+    
+    return combinations
+
+def rate_model_with_combination(params, P_CO2, P_CO, P_H2, P_MeOH, P_H2O, T, rate_funcs, debug=False):
+    """Modified rate_model that uses different numerator combinations but same denominator"""
+    try:
+        A_MeOH, Ea_MeOH, A_MeOH_CO, Ea_MeOH_CO, A_RWGS, Ea_RWGS, B_CO2, dH_CO2, B_H2, dH_H2, B_CO, dH_CO, B_H2O, dH_H2O = params
+    
+        # Add small epsilon to prevent division by zero
+        epsilon = 1e-10
+        P_H2_safe = np.maximum(P_H2, epsilon)
+    
+        # Calculate all constants
+        k_MeOH = arrhenius(A_MeOH, Ea_MeOH, T)
+        k_MeOH_CO = arrhenius(A_MeOH_CO, Ea_MeOH_CO, T)
+        k_RWGS = arrhenius(A_RWGS, Ea_RWGS, T)
+    
+        K_CO2 = vanthoff(B_CO2, dH_CO2, T)
+        K_H2 = vanthoff(B_H2, dH_H2, T)
+        K_CO = vanthoff(B_CO, dH_CO, T)
+        K_H2O = vanthoff(B_H2O, dH_H2O, T)
+    
+        # Calculate equilibrium constants with safety
+        Keq_m = np.maximum(Keq_MeOH(T), epsilon)
+        Keq_rwgs = np.maximum(Keq_RWGS(T), epsilon)
+        Keq_m_co = np.maximum(Keq_MeOH_CO(T), epsilon)
+    
+        # Common denominator calculation (same for all combinations)
+        term1 = np.maximum(1 + K_CO * P_CO + K_CO2 * P_CO2, epsilon)
+        term2 = np.maximum(P_H2_safe**0.5 + K_H2O * P_H2O, epsilon)
+        denom = term1 * term2
+    
+        # Modify the driving force calculations to use passed rate functions
+        df_MeOH = rate_funcs['meoh_func'](P_CO2, P_H2_safe, P_MeOH, P_H2O, Keq_m)
+        df_RWGS = rate_funcs['rwgs_func'](P_CO2, P_H2_safe, P_CO, P_H2O, Keq_rwgs)
+        df_MeOH_CO = rate_funcs['meoh_co_func'](P_CO, P_H2_safe, P_MeOH, Keq_m_co)
+    
+        # Calculate rates with different numerators but same denominator
+        r_MeOH = np.clip(k_MeOH * K_CO2 * df_MeOH / denom, -1e6, 1e6)
+        r_RWGS = np.clip(k_RWGS * K_CO2 * df_RWGS / denom, -1e6, 1e6)
+        r_MeOH_CO = np.clip(k_MeOH_CO * K_CO * df_MeOH_CO / denom, -1e6, 1e6)
+    
+        return r_MeOH, r_RWGS, r_MeOH_CO
+
+    except Exception as e:
+        print(f"Error in rate_model_with_combination: {e}")
+        traceback.print_exc()
+        raise
+
+def plug_flow_reactor(z, C, T, u_s_initial, params, combination_data=None):
+    """
+    ODE function for reactor model with improved numerical stability
+    """
+    # Set minimum concentration threshold
+    min_conc = 1e-20
+    
+    # Ensure positive concentrations with smooth transition
+    C = np.array(C, dtype=float)
+    C = np.maximum(C, min_conc)
+    
+    # Calculate partial pressures with safety checks
+    RT = R * T
+    P = np.maximum(C * RT, min_conc) / 1e5  # Convert to bar with minimum threshold
+    
+    # Get reaction rates with guaranteed positive pressures
+    r_MeOH, r_RWGS, r_MeOH_CO = rate_model_with_combination(
+        params,
+        P[0],  # P_CO2
+        P[1],  # P_CO
+        P[2],  # P_H2
+        P[3],  # P_MeOH
+        P[4],  # P_H2O
+        T,
+        combination_data,  # Pass the entire combination data
+        debug=False
+    )
+    
+    # Calculate total molar concentration with safety
+    C_total = np.sum(C)
+    C_total_initial = np.sum(C)
+    
+    # Calculate stoichiometric changes with bounded rates
+    delta_n_total = rb * (-2 * r_MeOH + 0 * r_RWGS - 2 * r_MeOH_CO)
+    
+    # Ensure reasonable contraction factor
+    C_total_updated = max(C_total + delta_n_total, min_conc)
+    contraction_factor = max(min(C_total_initial / C_total_updated, 10.0), 0.1)
+    
+    # Calculate local velocity with bounds
+    u_s_local = max(u_s_initial * contraction_factor, u_s_initial * 0.1)
+    
+    # Calculate reaction terms with bounded rates
+    reaction_terms = np.array([
+        rb * (-r_MeOH - r_RWGS),                    # CO2
+        rb * (r_RWGS - r_MeOH_CO),                  # CO
+        rb * (-3*r_MeOH - 2*r_MeOH_CO - r_RWGS),   # H2
+        rb * (r_MeOH + r_MeOH_CO),                  # MeOH
+        rb * (r_MeOH + r_RWGS)                      # H2O
+    ])
+    
+    # Calculate derivatives with safety checks
+    dCdz = np.clip(reaction_terms / u_s_local, -1e7, 1e7)
+    
+    return dCdz
+
+def calculate_exit_partial_pressures(params, T, u_s, initial_conditions, combination_data):
+    """
+    Calculate exit partial pressures using the plug flow reactor model
+    """
+    try:
+        # Solve ODE
+        partial_reactor = partial(
+            plug_flow_reactor,
+            params=params,
+            T=T,
+            u_s_initial=u_s,
+            combination_data=combination_data
+        )
+        
+        sol = solve_ivp(
+            partial_reactor,
+            [0, reactor_length],
+            initial_conditions,
+            method='BDF',
+            rtol=1e-6,
+            atol=1e-8,
+            max_step=reactor_length/15
+        )
+        
+        if not sol.success:
+            return None, None
+        
+        # Get exit concentrations
+        C_exit = sol.y[:, -1]
+        
+        # Calculate partial pressures at exit (convert to Pa)
+        P_exit = C_exit * R * T
+        
+        return P_exit, sol
+        
+    except Exception as e:
+        print(f"Error in exit pressure calculation: {e}")
+        traceback.print_exc()
+        return None, None
+
+def calculate_exit_partial_pressures_extended(params, T, u_s, initial_conditions, combination_data):
+    """
+    Calculate exit partial pressures and also return additional information for formation rates
+    """
+    try:
+        # Solve ODE
+        partial_reactor = partial(
+            plug_flow_reactor,
+            params=params,
+            T=T,
+            u_s_initial=u_s,
+            combination_data=combination_data
+        )
+        
+        sol = solve_ivp(
+            partial_reactor,
+            [0, reactor_length],
+            initial_conditions,
+            method='BDF',
+            rtol=1e-6,
+            atol=1e-8,
+            max_step=reactor_length/15
+        )
+        
+        if not sol.success:
+            return None, None, None
+        
+        # Get exit concentrations
+        C_exit = sol.y[:, -1]
+        
+        # Calculate partial pressures at exit (convert to Pa)
+        P_exit = C_exit * R * T
+        
+        # Calculate contraction factor at exit - using your existing logic from plug_flow_reactor
+        min_conc = 1e-20
+        C_total_exit = np.sum(C_exit)
+        C_total_inlet = np.sum(initial_conditions)
+        
+        # Ensure reasonable contraction factor - same logic as in plug_flow_reactor
+        contraction_factor = max(min(C_total_inlet / max(C_total_exit, min_conc), 10.0), 0.1)
+        
+        # Calculate exit velocity using the same logic as in your reactor model
+        u_s_exit = max(u_s * contraction_factor, u_s * 0.1)
+        
+        # Package additional information for the formation rate calculations
+        additional_info = {
+            'contraction_factor': contraction_factor,
+            'u_s_exit': u_s_exit
+        }
+        
+        # Return partial pressures (Pa), solution, and additional info
+        return P_exit, sol, additional_info
+        
+    except Exception as e:
+        print(f"Error in exit pressure calculation: {e}")
+        traceback.print_exc()
+        return None, None, None
+
+def objective_function_flexible(params, combination_data, optimization_strategy='partial_pressures'):
+    """
+    Flexible objective function that can optimize for different targets:
+    - 'partial_pressures': Original strategy focusing on RWGS pathway and water production
+    - 'formation_rates': Focuses on methanol and water formation rates using measured data
+    - 'products': Focuses on methanol and water exit partial pressures
+    """
+    if check_timeout():
+        print(f"Rank {rank} - Timeout reached in objective function")
+        return float('inf')
+    
+    # Initialize counter for debug output
+    if not hasattr(objective_function_flexible, f'counter_rank_{rank}'):
+        setattr(objective_function_flexible, f'counter_rank_{rank}', 0)
+    
+    rank_counter = getattr(objective_function_flexible, f'counter_rank_{rank}')
+    
+    # Debug output
+    if rank_counter % 100 == 0:
+        param_names = ['A_MeOH', 'Ea_MeOH', 'A_MeOH_CO', 'Ea_MeOH_CO', 'A_RWGS', 'Ea_RWGS', 
+                      'B_CO2', 'dH_CO2', 'B_H2', 'dH_H2', 'B_CO', 'dH_CO', 'B_H2O', 'dH_H2O']
+        param_str = ' | '.join([f"{name}: {value:.2e}" for name, value in zip(param_names, params)])
+        
+        print(f"\nRank {rank} - Combination {combination_data['id']} - Iteration {rank_counter}")
+        print(f"Strategy: {optimization_strategy}")
+        print(f"Parameters: {param_str}")
+        sys.stdout.flush()
+    
+    # Update counter
+    setattr(objective_function_flexible, f'counter_rank_{rank}', rank_counter + 1)
+    
+    try:
+        total_error = 0
+        
+        for i in range(len(T)):
+            if check_timeout():
+                return float('inf')
+
+            initial_conditions = np.array([
+                P_CO2_i[i] / (R * T[i]),
+                P_CO_i[i] / (R * T[i]),
+                P_H2_i[i] / (R * T[i]),
+                P_MeOH_i[i] / (R * T[i]),
+                P_H2O_i[i] / (R * T[i])
+            ])
+            
+            # Calculate exit partial pressures and ODE solution
+            if optimization_strategy == 'partial_pressures':
+                # For the original strategy, we can use the existing function
+                P_exit, sol = calculate_exit_partial_pressures(
+                    params,
+                    T[i],
+                    u_s[i],
+                    initial_conditions,
+                    combination_data
+                )
+                additional_info = None
+            else:
+                # For other strategies, we need the extended function
+                P_exit, sol, additional_info = calculate_exit_partial_pressures_extended(
+                    params,
+                    T[i],
+                    u_s[i],
+                    initial_conditions,
+                    combination_data
+                )
+
+            if P_exit is None:
+                return 1e10
+            
+            # Calculate point error based on the chosen optimization strategy
+            if optimization_strategy == 'partial_pressures':
+                # Original strategy: RWGS pathway and water production
+                rel_error_H2O = ((P_exit[4] - P_H2O_exp[i]) / P_H2O_exp[i])**2
+                rel_error_CO = ((P_exit[1] - P_CO_exp[i]) / P_CO_exp[i])**2
+                rel_error_CO2 = ((P_exit[0] - P_CO2_exp[i]) / P_CO2_exp[i])**2
+                
+                w_H2O = 3.0   # Higher weight for water production
+                w_CO = 2.0    # Medium weight for CO (RWGS product)
+                w_CO2 = 1.0   # Lower weight for CO2 consumption
+                
+                point_error = (w_H2O * rel_error_H2O + 
+                               w_CO * rel_error_CO + 
+                               w_CO2 * rel_error_CO2)
+                
+            elif optimization_strategy == 'formation_rates':
+                # Calculate methanol and water formation rates from the model
+                # Get contraction information from the extended function
+                u_s_exit = additional_info['u_s_exit']
+                
+                # Initial molar flow rates (mol/s)
+                F_initial = initial_conditions * u_s[i] * A_cross
+                
+                # Exit molar flow rates (mol/s)
+                C_exit = sol.y[:, -1]
+                F_exit = C_exit * u_s_exit * A_cross
+                
+                # Formation rates (mol/s/kg_cat)
+                MeOH_formation_rate = (F_exit[3] - F_initial[3]) / m_cat
+                H2O_formation_rate = (F_exit[4] - F_initial[4]) / m_cat
+                
+                # Use the measured experimental rates directly
+                rel_error_MeOH_rate = ((MeOH_formation_rate - MeOH_rate_exp[i]) / max(abs(MeOH_rate_exp[i]), 1e-10))**2
+                rel_error_H2O_rate = ((H2O_formation_rate - H2O_rate_exp[i]) / max(abs(H2O_rate_exp[i]), 1e-10))**2
+                
+                w_MeOH = 2.0  # Weight for methanol formation
+                w_H2O = 1.0   # Weight for water formation
+                
+                point_error = w_MeOH * rel_error_MeOH_rate + w_H2O * rel_error_H2O_rate
+                
+            elif optimization_strategy == 'products':
+                # Focus on methanol and water exit partial pressures
+                rel_error_MeOH = ((P_exit[3] - P_MeOH_exp[i]) / max(P_MeOH_exp[i], 1.0))**2
+                rel_error_H2O = ((P_exit[4] - P_H2O_exp[i]) / max(P_H2O_exp[i], 1.0))**2
+                
+                w_MeOH = 1.0  # Weight for methanol
+                w_H2O = 2.0   # Weight for water
+                
+                point_error = w_MeOH * rel_error_MeOH + w_H2O * rel_error_H2O
+            
+            else:
+                raise ValueError(f"Unknown optimization strategy: {optimization_strategy}")
+            
+            total_error += point_error
+                
+        if rank_counter % 500 == 0:
+            print(f"\nRank {rank} - Error at iteration {rank_counter}: {total_error:.2e}")
+            sys.stdout.flush()
+        
+        return total_error
+        
+    except Exception as e:
+        print(f"Rank {rank} - Error in objective function: {str(e)}")
+        traceback.print_exc()
+        sys.stdout.flush()
+        return 1e10
+    
+def progress_callback(xk, convergence):
+    """
+    Callback function for differential evolution to report optimization progress
+    and check for timeout
+    
+    Args:
+        xk: Current parameter vector
+        convergence: Current convergence value
+    
+    Returns:
+        bool: True if optimization should stop (timeout), False otherwise
+    """
+    # Initialize storage for tracking progress
+    if not hasattr(progress_callback, 'iterations'):
+        progress_callback.iterations = 0
+        progress_callback.last_report_time = time.time()
+        progress_callback.start_time = time.time()
+    
+    progress_callback.iterations += 1
+    
+    # Report progress every 10 minutes or every 10 iterations
+    time_since_last = time.time() - progress_callback.last_report_time
+    if time_since_last > 600 or progress_callback.iterations % 10 == 0:
+        progress_callback.last_report_time = time.time()
+        
+        # Calculate runtime
+        elapsed_hrs = (time.time() - progress_callback.start_time) / 3600
+        
+        # Print detailed progress info
+        print("\n" + "="*60)
+        print(f"Rank {rank} - DE Progress Report - Iteration {progress_callback.iterations}")
+        print(f"Current time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Convergence measure: {convergence:.6e}")
+        print(f"Runtime: {elapsed_hrs:.2f} hours of {MAX_RUNTIME/3600:.1f} hours max")
+        
+        # Calculate remaining runtime estimate
+        if convergence > 0:
+            rate = progress_callback.iterations / elapsed_hrs if elapsed_hrs > 0 else 0
+            print(f"Iteration rate: {rate:.1f} iterations/hour")
+        
+        print("="*60)
+        sys.stdout.flush()  # Ensure output is flushed to console
+    
+    # Check for timeout
+    return check_timeout()
+
+
+def run_global_optimization(combination_data, optimization_strategy='partial_pressures'):
+    try:
+        local_rank = rank
+        optimization_start_time = time.time()
+        
+        print(f"Rank {local_rank} - Starting global optimization with strategy: {optimization_strategy}")
+        print(f"Rank {local_rank} - Combination ID: {combination_data['id']}")
+        
+        # Define parameter bounds in log space where appropriate
+        bounds = [
+            (1e-15, 1e5),      # A_MeOH (can be very small)
+            (1e3, 2e5),        # Ea_MeOH (stays in normal space)
+            (1e-15, 1e5),      # A_MeOH_CO
+            (1e3, 2e5),        # Ea_MeOH_CO
+            (1e-15, 1e5),      # A_RWGS
+            (1e3, 2e5),        # Ea_RWGS
+            (1e-15, 10),       # B_CO2
+            (-2e5, -1e2),      # dH_CO2
+            (1e-15, 10),       # B_H2
+            (-2e5, -1e2),      # dH_H2
+            (1e-15, 10),       # B_CO
+            (-2e5, -1e2),      # dH_CO
+            (1e-15, 10),       # B_H2O
+            (-2e5, -1e2)       # dH_H2O
+        ]
+        
+        # Literature guess - keep as reference
+        literature_guess = np.array([
+            7.1e-1, 3.38e4, 1.42e9, 1.2e5, 2.76e11, 1.34e5,
+            6.173e-7, -5.67e4, 1e-3, -1.05e5, 3.56e-3, -8.44e3, 3.52e-12, -1.24e5
+        ])
+        
+        # Graaf guess - keep as reference
+        graaf_guess = np.array([
+            4.89e-13, 1.067e5, 1.02e10, 1.1e5, 1.22e5, 9.88e4,
+            4.13e-3, -7.0e4, 5.82e-8, -5.89e4, 1.75e-7, -5.0e4, 1.46e-3, -9.24e4
+        ])
+        
+        # Create a wrapper for the objective function that adds robustness
+        def robust_objective(params):
+            # Check for NaN or infinity in parameters
+            if np.any(np.isnan(params)) or np.any(np.isinf(params)):
+                return 1e10
+                
+            # Apply parameter constraints with penalty
+            penalty = 0
+            # Penalize unreasonably large values
+            for p in params:
+                if abs(p) > 1e12:
+                    penalty += abs(p) / 1e12
+            
+            # Call the original objective function
+            try:
+                result = objective_function_flexible(params, combination_data, optimization_strategy)
+                # If result is NaN or infinity, return a high value
+                if np.isnan(result) or np.isinf(result):
+                    return 1e10 + penalty
+                return result + penalty
+            except Exception as e:
+                print(f"Error in objective function: {e}")
+                return 1e10 + penalty
+        
+        # Run differential evolution with more conservative settings
+        print(f"Rank {local_rank} - Starting differential evolution")
+        de_result = differential_evolution(
+            robust_objective,
+            bounds,
+            strategy='best1bin',
+            maxiter=300,            # Reduced from 500
+            popsize=15,
+            tol=0.02,               # More lenient tolerance
+            mutation=(0.3, 0.7),    # Reduced mutation rate range
+            recombination=0.7,
+            init='latinhypercube',
+            updating='deferred',
+            workers=1,
+            polish=False,
+            disp=True,
+            callback=progress_callback
+        )
+        # Extract results
+        de_params = de_result.x
+        de_error = de_result.fun
+        
+        print(f"Rank {local_rank} - DE optimization completed with error: {de_error:.4e}")
+        print(f"Rank {local_rank} - Success: {de_result.success}, Message: {de_result.message}")
+        
+        # Refine with local optimization if DE was successful
+        if de_result.success and not check_timeout():
+            print(f"Rank {local_rank} - Starting local refinement with Nelder-Mead")
+            
+            # Run local optimization from DE result
+            local_result = fmin(
+                obj_function,
+                de_params,
+                maxiter=1000,
+                maxfun=2000,
+                ftol=1e-6,
+                xtol=1e-6,
+                disp=True
+            )
+            
+            local_error = obj_function(local_result)
+            
+            # Use the best result
+            if local_error < de_error:
+                print(f"Rank {local_rank} - Local refinement improved result: {de_error:.4e} -> {local_error:.4e}")
+                final_result = local_result
+                final_error = local_error
+            else:
+                print(f"Rank {local_rank} - Local refinement did not improve result")
+                final_result = de_params
+                final_error = de_error
+        else:
+            final_result = de_params
+            final_error = de_error
+        
+        # Save results
+        elapsed_time = (time.time() - optimization_start_time) / 60
+        save_rank_results(
+            local_rank,
+            f"{combination_data['id']}_{optimization_strategy}_global",  # Include strategy and global in ID
+            final_result,
+            final_error,
+            elapsed_time,
+            combination_data=combination_data,
+            timeout=check_timeout()
+        )
+        
+        print(f"Rank {local_rank} - Optimization complete")
+        print(f"Rank {local_rank} - Final error: {final_error:.4e}")
+        
+        return final_result, final_error
+            
+    except Exception as e:
+        print(f"Rank {local_rank} - Critical error in optimization: {str(e)}")
+        traceback.print_exc()
+        return None, float('inf')
+
+def main_global_parallel(optimization_strategy='partial_pressures'):
+    """
+    Main function to run parallel global optimization of all rate combinations 
+    with the specified optimization strategy
+    """
+    try:
+        # Get all combinations
+        combinations = get_rate_combinations()
+        
+        # Ensure total combinations match number of ranks
+        if len(combinations) != size:
+            if rank == 0:
+                print(f"Warning: Number of combinations ({len(combinations)}) does not match number of ranks ({size})")
+            if len(combinations) < size:
+                combinations.extend([combinations[-1]] * (size - len(combinations)))
+            else:
+                combinations = combinations[:size]
+        
+        combination = combinations[rank]
+        
+        if rank == 0:
+            print(f"Total combinations: {len(combinations)}")
+            print(f"Number of ranks: {size}")
+            print(f"Maximum runtime set to {MAX_RUNTIME/3600:.1f} hours")
+            print(f"Optimization strategy: {optimization_strategy}")
+        
+        print(f"Rank {rank} - Starting optimization for combination ID: {combination['id']} with strategy: {optimization_strategy}")
+        
+        # Perform global optimization with the specified strategy
+        params, error = run_global_optimization(combination, optimization_strategy)
+        
+        # Gather results from all ranks
+        result_data = {
+            'combination_id': combination['id'],
+            'strategy': optimization_strategy,
+            'parameters': params,
+            'final_error': error,
+            'runtime': time.time() - start_time,
+            'timeout': check_timeout()
+        }
+        
+        all_results = comm.gather(result_data, root=0)
+        
+        if rank == 0:
+            # Process and save final results
+            valid_results = [r for r in all_results if r is not None and 'parameters' in r and r['parameters'] is not None]
+            if valid_results:
+                # Sort by error and save results
+                sorted_results = sorted(valid_results, key=lambda x: x['final_error'])
+                
+                results_df = pd.DataFrame([
+                    {
+                        'catalyst': CATALYST_NAME,
+                        'combination_id': r['combination_id'],
+                        'strategy': r['strategy'],
+                        'final_error': r['final_error'],
+                        'runtime_hours': r['runtime'] / 3600,
+                        'timeout': r['timeout'],
+                        **{f'param_{i}': v for i, v in enumerate(r['parameters'])}
+                    }
+                    for r in sorted_results
+                ])
+                
+                results_file = OUTPUT_DIR / f'final_optimization_results_{CATALYST_NAME}_{optimization_strategy}_global.csv'
+                results_df.to_csv(results_file, index=False)
+                print(f"\nFinal results saved to: {results_file}")
+                
+                # Print best result
+                best_result = sorted_results[0]
+                print(f"\nBest combination: {best_result['combination_id']}")
+                print(f"Optimization strategy: {best_result['strategy']}")
+                print(f"Final error: {best_result['final_error']:.4e}")
+                print(f"Runtime: {best_result['runtime']/3600:.2f} hours")
+                
+    except Exception as e:
+        print(f"Rank {rank} - Critical error in main function: {e}")
+        traceback.print_exc()
+
+def save_rank_results(rank, combination_id, params, error, timestamp, combination_data=None, timeout=False):
+    """Simplified results saving function"""
+    try:
+        result_dict = {
+            'catalyst': CATALYST_NAME,
+            'rank': rank,
+            'combination_id': combination_id,
+            'final_error': error,
+            'calculation_time_minutes': timestamp,
+            'timeout': timeout,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'total_runtime_hours': (time.time() - start_time) / 3600
+        }
+        
+        # Add parameters
+        param_names = ['A_MeOH', 'Ea_MeOH', 'A_MeOH_CO', 'Ea_MeOH_CO', 'A_RWGS', 'Ea_RWGS', 
+                      'B_CO2', 'dH_CO2', 'B_H2', 'dH_H2', 'B_CO', 'dH_CO', 'B_H2O', 'dH_H2O']
+        for name, value in zip(param_names, params):
+            result_dict[f'param_{name}'] = value
+            
+        # Calculate exit pressures for all test points
+        exit_pressures = []
+        for i in range(len(T)):
+            initial_conditions = np.array([
+                P_CO2_i[i] / (R * T[i]),
+                P_CO_i[i] / (R * T[i]),
+                P_H2_i[i] / (R * T[i]),
+                P_MeOH_i[i] / (R * T[i]),
+                P_H2O_i[i] / (R * T[i])
+            ])
+            
+            P_exit, _ = calculate_exit_partial_pressures(
+                params, T[i], u_s[i], initial_conditions, combination_data
+            )
+            
+            if P_exit is not None:
+                exit_data = {
+                    'point': i,
+                    'Temperature_K': T[i],
+                    'P_CO2_exit_Pa': P_exit[0],
+                    'P_CO_exit_Pa': P_exit[1],
+                    'P_H2_exit_Pa': P_exit[2],
+                    'P_MeOH_exit_Pa': P_exit[3],
+                    'P_H2O_exit_Pa': P_exit[4],
+                    'P_CO2_exp_Pa': P_CO2_exp[i],
+                    'P_CO_exp_Pa': P_CO_exp[i],
+                    'P_H2_exp_Pa': P_H2_exp[i],
+                    'P_MeOH_exp_Pa': P_MeOH_exp[i],
+                    'P_H2O_exp_Pa': P_H2O_exp[i]
+                }
+                exit_pressures.append(exit_data)
+        
+        # Save to files
+        summary_filename = f'rank_{rank}_combination_{combination_id}_{CATALYST_NAME}_summary.csv'
+        details_filename = f'rank_{rank}_combination_{combination_id}_{CATALYST_NAME}_exit_pressures.csv'
+        
+        pd.DataFrame([result_dict]).to_csv(OUTPUT_DIR / summary_filename, index=False)
+        pd.DataFrame(exit_pressures).to_csv(OUTPUT_DIR / details_filename, index=False)
+        
+        print(f"Rank {rank} results saved to {summary_filename} and {details_filename}")
+        
+    except Exception as e:
+        print(f"Error saving results for rank {rank}: {e}")
+        traceback.print_exc()
+
+# This is the crucial part that's missing - the actual execution code!
+if __name__ == "__main__":
+    # Set the optimization strategy here - choose from:
+    # 'partial_pressures': Original strategy (CO2, CO, H2O partial pressures)
+    # 'formation_rates': Focus on methanol and water formation rates
+    # 'products': Focus on methanol and water exit partial pressures
+    optimization_strategy = 'products'  # Change this to your desired strategy
+    
+    if rank == 0:
+        print(f"Starting global parallel optimization with strategy: {optimization_strategy}")
+        print(f"Using Differential Evolution with local refinement")
+        print(f"Timeout set to {MAX_RUNTIME/3600:.1f} hours")
+    
+    # This call actually starts the optimization process
+    main_global_parallel(optimization_strategy)
